@@ -13,10 +13,11 @@ import { DEFAULT_ROLE_FOR_CROSS_ACCOUNT_ACCESS } from '~util/aws-util';
 
 export class DefaultTemplateWriter {
     public organizationModel: AwsOrganization;
+    public partitionOrganizationModel: AwsOrganization | undefined;
     public logicalNames: LogicalNames;
     public DefaultBuildProcessAccessRoleName: string;
 
-    constructor(organizationModel?: AwsOrganization) {
+    constructor(organizationModel?: AwsOrganization, partitionOrganizationModel?: AwsOrganization) {
         if (organizationModel) {
             this.organizationModel = organizationModel;
         } else {
@@ -24,6 +25,8 @@ export class DefaultTemplateWriter {
             const reader = new AwsOrganizationReader(org);
             this.organizationModel = new AwsOrganization(reader);
         }
+
+        this.partitionOrganizationModel = partitionOrganizationModel;
         this.logicalNames = new LogicalNames();
     }
 
@@ -34,7 +37,11 @@ export class DefaultTemplateWriter {
         const lines: YamlLine[] = [];
         this.generateTemplateHeader(lines, this.organizationModel.organization);
 
-        const result = this.generateMasterAccount(lines, this.organizationModel.masterAccount);
+        const masterAccount: AWSAccount = this.organizationModel.masterAccount;
+        if (this.partitionOrganizationModel?.masterAccount) {
+            masterAccount.PartitionId = this.partitionOrganizationModel.masterAccount.Id;
+        }
+        const result = this.generateMasterAccount(lines, masterAccount);
 
         const masterAccountBinding: IBinding = {
             type: result.type,
@@ -43,8 +50,8 @@ export class DefaultTemplateWriter {
             lastCommittedHash: '',
         };
 
-        if (this.organizationModel.masterAccount.PartitionAccountId) {
-            masterAccountBinding.partitionAccountId = this.organizationModel.masterAccount.PartitionAccountId;
+        if (this.organizationModel.masterAccount.PartitionId) {
+            masterAccountBinding.partitionId = this.organizationModel.masterAccount.PartitionId;
         }
 
         bindings.push(masterAccountBinding);
@@ -55,11 +62,14 @@ export class DefaultTemplateWriter {
             if (!root.Id) {
                 throw new OrgFormationError(`organizational root ${root.Name} has no Id`);
             }
+            const partitionRoot: AWSRoot[] = this.partitionOrganizationModel?.roots;
+
             bindings.push({
                 type: rootResource.type,
                 logicalId: rootResource.logicalName,
                 physicalId: root.Id,
                 lastCommittedHash: '',
+                partitionId: (partitionRoot) ? partitionRoot[0].Id : '',
             });
         }
         for (const predefinedOu of templateGenerationSettings.predefinedOUs) {
@@ -70,26 +80,27 @@ export class DefaultTemplateWriter {
                 logicalId: ouResource.logicalName,
                 physicalId: predefinedOu.id,
                 lastCommittedHash: '',
+                partitionId: predefinedOu.id,
             });
 
         }
         for (const organizationalUnit of this.organizationModel.organizationalUnits) {
             const wasPredefined = templateGenerationSettings.predefinedOUs.some(x => x.id === organizationalUnit.Id);
             if (wasPredefined) { continue; }
-
             const organizationalUnitResource = this.generateOrganizationalUnit(lines, organizationalUnit);
+            const partitionOu: AWSOrganizationalUnit = this.partitionOrganizationModel?.organizationalUnits?.find(x => x.Name === organizationalUnit.Name);
             bindings.push({
                 type: organizationalUnitResource.type,
                 logicalId: organizationalUnitResource.logicalName,
                 physicalId: organizationalUnit.Id,
                 lastCommittedHash: '',
+                partitionId: (partitionOu) ? partitionOu.Id : '',
             });
         }
 
         for (const predefinedAccount of templateGenerationSettings.predefinedAccounts) {
             const acct = this.organizationModel.accounts.find(x => x.Id === predefinedAccount.id);
             const accountResource = this.generatePredefinedAccount(lines, predefinedAccount, acct);
-
             bindings.push({
                 type: accountResource.type,
                 logicalId: accountResource.logicalName,
@@ -102,8 +113,12 @@ export class DefaultTemplateWriter {
             const wasPredefined = templateGenerationSettings.predefinedAccounts.some(x => x.id === account.Id);
             if (wasPredefined) { continue; }
 
-            const accountResource = this.generateAccount(lines, account);
+            const partitionAccount = this.partitionOrganizationModel?.accounts.find(p => p.Name === account.Name);
+            if (partitionAccount) {
+                account.PartitionId = partitionAccount.Id;
+            }
 
+            const accountResource = this.generateAccount(lines, account);
             const accountBinding: IBinding = {
                 type: accountResource.type,
                 logicalId: accountResource.logicalName,
@@ -111,8 +126,8 @@ export class DefaultTemplateWriter {
                 lastCommittedHash: '',
             };
 
-            if (account.PartitionAccountId) {
-                accountBinding.partitionAccountId = account.PartitionAccountId;
+            if (account.PartitionId) {
+                accountBinding.partitionId = account.PartitionId;
             }
 
             bindings.push(accountBinding);
@@ -120,12 +135,13 @@ export class DefaultTemplateWriter {
         for (const scp of this.organizationModel.policies) {
             if (scp.PolicySummary && scp.PolicySummary.AwsManaged) { continue; }
             const policyResource = this.generateSCP(lines, scp);
-
+            const partitionPolicy: AWSPolicy = this.partitionOrganizationModel?.policies?.find(x => x.Name === scp.Name);
             bindings.push({
                 type: policyResource.type,
                 logicalId: policyResource.logicalName,
                 physicalId: scp.Id,
                 lastCommittedHash: '',
+                partitionId: (partitionPolicy) ? partitionPolicy.Id : '',
             });
         }
 
@@ -281,8 +297,8 @@ export class DefaultTemplateWriter {
             lines.push(new Line('PartitionAlias', account.PartitionAlias, 6));
         }
 
-        if (account.PartitionAccountId) {
-            lines.push(new Line('PartitionAccountId', account.PartitionAccountId, 6));
+        if (account.PartitionId) {
+            lines.push(new Line('PartitionId', account.PartitionId, 6));
         }
         if (account.Tags) {
             const tags = Object.entries(account.Tags);
@@ -316,7 +332,7 @@ export class DefaultTemplateWriter {
             lines.push(new Line('DefaultBuildAccessRoleName', this.DefaultBuildProcessAccessRoleName, 6));
         }
         lines.push(new ListLine('ServiceControlPolicies', policiesList, 6));
-        if (masterAccount.PartitionAccountId) {
+        if (masterAccount.PartitionId) {
             lines.push(new Line('MirrorInPartition', 'true', 6));
         }
         lines.push(new EmptyLine());
@@ -363,8 +379,8 @@ export class DefaultTemplateWriter {
         if (masterAccount.Alias) {
             lines.push(new Line('Alias', masterAccount.Alias, 6));
         }
-        if (masterAccount.PartitionAccountId) {
-            lines.push(new Line('PartitionAccountId', masterAccount.PartitionAccountId, 6));
+        if (masterAccount.PartitionId) {
+            lines.push(new Line('PartitionId', masterAccount.PartitionId, 6));
         }
         if (masterAccount.Tags) {
             const tags = Object.entries(masterAccount.Tags);

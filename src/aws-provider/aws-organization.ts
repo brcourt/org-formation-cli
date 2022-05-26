@@ -9,7 +9,7 @@ export class AwsOrganization {
     public policies: AWSPolicy[];
     public accounts: AWSAccount[];
     public masterAccount: AWSAccount;
-    private readonly reader: AwsOrganizationReader;
+    public readonly reader: AwsOrganizationReader;
     private initializationPromise: Promise<void>;
 
     constructor(reader: AwsOrganizationReader) {

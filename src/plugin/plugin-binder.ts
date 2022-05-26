@@ -22,19 +22,20 @@ export class PluginBinder<TTaskDefinition extends IPluginTask> {
 
     public enumBindings(): IPluginBinding<TTaskDefinition>[] {
         const isGovCloud = AwsUtil.GetIsPartition();
+        const regions = this.template.resolveNormalizedRegions(this.organizationBinding);
+
         const result: IPluginBinding<TTaskDefinition>[] = [];
         for (const logicalTargetAccountName of this.template.resolveNormalizedLogicalAccountIds(this.organizationBinding)) {
 
             const accountBinding = this.state.getAccountBinding(logicalTargetAccountName);
             if (!accountBinding) { throw new OrgFormationError(`unable to find account ${logicalTargetAccountName} in state. Is your organization up to date?`); }
 
-            const regions = this.template.resolveNormalizedRegions(this.organizationBinding);
             if (regions.length === 0) {
                 ConsoleUtil.LogWarning(`Task ${this.task.type} / ${this.task.name} is not bind to any region. Therefore, this task will not be executed.`);
             }
             for (const region of regions) {
-
-                const existingTargetBinding = this.state.getGenericTarget<TTaskDefinition>(this.task.type, this.organizationLogicalName, this.logicalNamePrefix, this.task.name, accountBinding.physicalId, region);
+                const accountId = isGovCloud ? accountBinding.partitionId : accountBinding.physicalId;
+                const existingTargetBinding = this.state.getGenericTarget<TTaskDefinition>(this.task.type, this.organizationLogicalName, this.logicalNamePrefix, this.task.name, accountId, region);
 
                 const binding: IPluginBinding<TTaskDefinition> = {
                     action: 'UpdateOrCreate',
@@ -42,7 +43,7 @@ export class PluginBinder<TTaskDefinition extends IPluginTask> {
                         targetType: this.task.type,
                         logicalAccountId: logicalTargetAccountName,
                         region,
-                        accountId: isGovCloud ? accountBinding.partitionAccountId : accountBinding.physicalId,
+                        accountId,
                         definition: this.task,
                         logicalName: this.task.name,
                         logicalNamePrefix: this.logicalNamePrefix,
@@ -71,25 +72,25 @@ export class PluginBinder<TTaskDefinition extends IPluginTask> {
 
         const targetsInState = this.state.enumGenericTargets<TTaskDefinition>(this.task.type, this.organizationLogicalName, this.logicalNamePrefix, this.task.name);
         for (const targetToBeDeleted of targetsInState.filter(x => !result.find(y => y.target.accountId === x.accountId && y.target.region === x.region))) {
-            result.push({
-                action: 'Delete',
-                task: targetToBeDeleted.definition,
-                target: {
-                    targetType: this.task.type,
-                    logicalAccountId: targetToBeDeleted.logicalAccountId,
-                    region: targetToBeDeleted.region,
-                    accountId: targetToBeDeleted.accountId,
-                    logicalNamePrefix: this.logicalNamePrefix,
-                    organizationLogicalName: this.organizationLogicalName,
-                    definition: targetToBeDeleted.definition,
-                    logicalName: targetToBeDeleted.definition.name,
-                    lastCommittedHash: targetToBeDeleted.definition.hash,
-                },
-                previousBindingLocalHash: targetToBeDeleted.lastCommittedLocalHash,
-            });
-
-            ConsoleUtil.LogDebug(`Setting build action on ${this.task.type} / ${this.task.name} for ${targetToBeDeleted.accountId} to Delete`, this.task.logVerbose);
-
+            if (regions.indexOf(targetToBeDeleted.region) > -1) {
+                result.push({
+                    action: 'Delete',
+                    task: targetToBeDeleted.definition,
+                    target: {
+                        targetType: this.task.type,
+                        logicalAccountId: targetToBeDeleted.logicalAccountId,
+                        region: targetToBeDeleted.region,
+                        accountId: targetToBeDeleted.accountId,
+                        logicalNamePrefix: this.logicalNamePrefix,
+                        organizationLogicalName: this.organizationLogicalName,
+                        definition: targetToBeDeleted.definition,
+                        logicalName: targetToBeDeleted.definition.name,
+                        lastCommittedHash: targetToBeDeleted.definition.hash,
+                    },
+                    previousBindingLocalHash: targetToBeDeleted.lastCommittedLocalHash,
+                });
+                ConsoleUtil.LogDebug(`Setting build action on ${this.task.type} / ${this.task.name} for ${targetToBeDeleted.accountId} to Delete`, this.task.logVerbose);
+            }
         }
         return result;
     }

@@ -1,6 +1,8 @@
-import { IAM, Organizations, STS } from 'aws-sdk/clients/all';
-import { Account, Accounts, ListAccountsForParentRequest, ListAccountsRequest, ListAccountsResponse, ListOrganizationalUnitsForParentRequest, ListOrganizationalUnitsForParentResponse, ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest, ListRootsResponse, ListTagsForResourceRequest, ListTargetsForPolicyRequest, ListTargetsForPolicyResponse, Organization, OrganizationalUnit, Policy, PolicyTargetSummary, Root, TargetType } from 'aws-sdk/clients/organizations';
-import { CredentialsOptions } from 'aws-sdk/lib/credentials';
+import { IAM, Organizations, Support } from 'aws-sdk/clients/all';
+import { Account, ListAccountsForParentRequest, ListAccountsResponse, ListOrganizationalUnitsForParentRequest,
+    ListOrganizationalUnitsForParentResponse, ListPoliciesRequest, ListPoliciesResponse, ListRootsRequest,
+    ListRootsResponse, ListTagsForResourceRequest, ListTargetsForPolicyRequest, ListTargetsForPolicyResponse,
+    Organization, OrganizationalUnit, Policy, PolicyTargetSummary, Root, TargetType } from 'aws-sdk/clients/organizations';
 import { AwsUtil } from '../util/aws-util';
 import { ConsoleUtil } from '../util/console-util';
 import { GetOrganizationAccessRoleInTargetAccount, ICrossAccountConfig } from './aws-account-access';
@@ -16,8 +18,9 @@ interface IAWSAccountWithTags {
     Tags?: IAWSTags;
 }
 
-interface IAWSAccountWithPartition {
-    PartitionAccountId?: string;
+interface IAWSObjectWithPartition {
+    PartitionArn?: string;
+    PartitionId?: string;
 }
 
 interface IAWSAccountWithIAMAttributes {
@@ -55,8 +58,8 @@ interface IPolicyTargets {
 }
 
 export type AWSPolicy = Policy & IPolicyTargets & IAWSObject;
-export type AWSAccount = Account & IAWSAccountWithPartition & IAWSAccountWithTags & IAWSAccountWithSupportLevel & IAWSAccountWithIAMAttributes & IObjectWithParentId & IObjectWithPolicies & IAWSObject & IAWSAccountWithPartition;
-export type AWSOrganizationalUnit = OrganizationalUnit & IObjectWithParentId & IObjectWithPolicies & IObjectWithAccounts & IAWSObject & IObjectWitOrganizationalUnits;
+export type AWSAccount = Account & IAWSAccountWithTags & IAWSAccountWithSupportLevel & IAWSAccountWithIAMAttributes & IObjectWithParentId & IObjectWithPolicies & IAWSObject & IAWSObjectWithPartition;
+export type AWSOrganizationalUnit = OrganizationalUnit & IObjectWithParentId & IObjectWithPolicies & IObjectWithAccounts & IAWSObject & IObjectWitOrganizationalUnits & IAWSObjectWithPartition;
 export type AWSRoot = Root & IObjectWithPolicies & IObjectWitOrganizationalUnits;
 
 const GetPoliciesForTarget = (list: AWSPolicy[], targetId: string, targetType: TargetType): AWSPolicy[] => {
@@ -65,12 +68,11 @@ const GetPoliciesForTarget = (list: AWSPolicy[], targetId: string, targetType: T
 
 export class AwsOrganizationReader {
 
-    private partitionOrgService: Organizations;
-    private partitionOrgSTS: STS;
-
     private static async getOrganization(that: AwsOrganizationReader): Promise<Organization> {
-
         const resp = await performAndRetryIfNeeded(() => that.organizationService.describeOrganization().promise());
+        if (resp.Organization.Arn.split(':')[1] === 'aws-us-gov') {
+            that.isPartition = true;
+        }
         return resp.Organization;
     }
 
@@ -117,12 +119,13 @@ export class AwsOrganizationReader {
         }
     }
 
-    private static async listRoots(that: AwsOrganizationReader): Promise<AWSRoot[]> {
+    public static async listRoots(that: AwsOrganizationReader): Promise<AWSRoot[]> {
+        const policies: AWSPolicy[] = await that.policies.getValue();
         try {
             const result: AWSRoot[] = [];
-            const policies = await that.policies.getValue();
             let resp: ListRootsResponse;
             const req: ListRootsRequest = {};
+
             do {
                 resp = await performAndRetryIfNeeded(() => that.organizationService.listRoots(req).promise());
                 req.NextToken = resp.NextToken;
@@ -144,12 +147,11 @@ export class AwsOrganizationReader {
     }
 
     private static async listOrganizationalUnits(that: AwsOrganizationReader): Promise<AWSOrganizationalUnit[]> {
+        const roots: AWSRoot[] = await that.roots.getValue();
+        const policies: AWSPolicy[] = await that.policies.getValue();
         try {
             const rootsIds: string[] = [];
             const result: AWSOrganizationalUnit[] = [];
-
-            const policies = await that.policies.getValue();
-            const roots = await that.roots.getValue();
             rootsIds.push(...roots.map(x => x.Id!));
 
             do {
@@ -205,14 +207,14 @@ export class AwsOrganizationReader {
     }
 
     private static async listAccounts(that: AwsOrganizationReader): Promise<AWSAccount[]> {
+        const roots: AWSRoot[] = await that.roots.getValue();
+        const policies: AWSPolicy[] = await that.policies.getValue();
+        const organizationalUnits: AWSOrganizationalUnit[] = await that.organizationalUnits.getValue();
+
         try {
             const result: AWSAccount[] = [];
-            const organizationalUnits = await that.organizationalUnits.getValue();
-            const policies = await that.policies.getValue();
-            const roots = await that.roots.getValue();
             const parentIds = organizationalUnits.map(x => x.Id);
             const rootIds = roots.map(x => x.Id);
-            const partitionCreds = await AwsUtil.GetPartitionCredentials();
             parentIds.push(...rootIds);
 
             do {
@@ -222,20 +224,6 @@ export class AwsOrganizationReader {
                 let resp: ListAccountsResponse;
                 do {
                     resp = await performAndRetryIfNeeded(() => that.organizationService.listAccountsForParent(req).promise());
-
-                    let gcResp: ListAccountsResponse;
-                    let partitionAccList: Accounts = [];
-
-                    if (partitionCreds) {
-                        const gcOrg = new Organizations({ region: AwsUtil.GetPartitionRegion(), credentials: partitionCreds });
-                        const partitionReq: ListAccountsRequest = {};
-                        do {
-                            gcResp = await gcOrg.listAccounts(partitionReq).promise();
-                            partitionAccList = partitionAccList.concat(gcResp.Accounts);
-                            partitionReq.NextToken = gcResp.NextToken;
-                        } while (gcResp.NextToken);
-
-                    }
                     req.NextToken = resp.NextToken;
 
                     for (const acc of resp.Accounts) {
@@ -243,20 +231,10 @@ export class AwsOrganizationReader {
                             continue;
                         }
 
-                        let gcAccount: Account = {};
-                        if (partitionAccList) {
-                            partitionAccList.forEach(gc => {
-                                if (gc.Name === acc.Name) {
-                                    gcAccount = gc;
-                                }
-                            });
-                        }
-
                         let tags: IAWSTags = {};
                         let alias: string;
                         let passwordPolicy: IAM.PasswordPolicy;
                         let supportLevel = 'basic';
-                        let partitionAlias: string;
 
                         try {
                             [tags, alias, passwordPolicy, supportLevel] = await Promise.all([
@@ -265,11 +243,6 @@ export class AwsOrganizationReader {
                                 AwsOrganizationReader.getIamPasswordPolicyForAccount(that, acc.Id),
                                 AwsOrganizationReader.getSupportLevelForAccount(that, acc.Id),
                             ]);
-
-                            if (gcAccount.Id) {
-                                partitionAlias = await AwsOrganizationReader.getIamAliasForPartitionAccount(that, gcAccount.Id);
-                            }
-
 
                         } catch (err) {
                             if (err.code === 'AccessDenied') {
@@ -282,7 +255,7 @@ export class AwsOrganizationReader {
 
                         const account = {
                             ...acc,
-                            Type: 'Account',
+                            Type: (that.isPartition) ? 'PartitionAccount' : 'Account',
                             Name: acc.Name,
                             Id: acc.Id,
                             ParentId: req.ParentId,
@@ -291,8 +264,6 @@ export class AwsOrganizationReader {
                             Alias: alias,
                             PasswordPolicy: passwordPolicy,
                             SupportLevel: supportLevel,
-                            PartitionAlias: partitionAlias,
-                            PartitionAccountId: gcAccount.Id,
                         };
 
                         const parentOU = organizationalUnits.find(x => x.Id === req.ParentId);
@@ -317,7 +288,8 @@ export class AwsOrganizationReader {
         await that.organization.getValue();
         try {
             const targetRoleConfig = await GetOrganizationAccessRoleInTargetAccount(that.crossAccountConfig, accountId);
-            const supportService = await AwsUtil.GetSupportService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole);
+            const supportService: Support = await AwsUtil.GetSupportService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole, that.isPartition);
+
             const severityLevels = await supportService.describeSeverityLevels().promise();
             const critical = severityLevels.severityLevels.find(x => x.code === 'critical');
             if (critical !== undefined) {
@@ -328,6 +300,7 @@ export class AwsOrganizationReader {
                 return 'business';
             }
             return 'developer';
+            return 'test';
         } catch (err) {
             if (err.code === 'SubscriptionRequiredException') {
                 return 'basic';
@@ -340,7 +313,8 @@ export class AwsOrganizationReader {
         try {
             await that.organization.getValue();
             const targetRoleConfig = await GetOrganizationAccessRoleInTargetAccount(that.crossAccountConfig, accountId);
-            const iamService = await AwsUtil.GetIamService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole);
+            const iamService: IAM = await AwsUtil.GetIamService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole, that.isPartition);
+
             const response = await iamService.listAccountAliases({ MaxItems: 1 }).promise();
             if (response && response.AccountAliases && response.AccountAliases.length >= 1) {
                 return response.AccountAliases[0];
@@ -353,41 +327,12 @@ export class AwsOrganizationReader {
         }
     }
 
-    private static async getIamAliasForPartitionAccount(that: AwsOrganizationReader, accountId: string): Promise<string> {
-        try {
-
-            const assumeParams = {
-                RoleArn: `arn:aws-us-gov:iam::${accountId}:role/OrganizationAccountAccessRole`,
-                RoleSessionName: 'AssumeRoleSession',
-            };
-            const role = await that.partitionOrgSTS.assumeRole(assumeParams).promise();
-
-            const iam = new IAM({
-                credentials: {
-                    accessKeyId: role.Credentials.AccessKeyId,
-                    secretAccessKey: role.Credentials.SecretAccessKey,
-                    sessionToken: role.Credentials.SessionToken,
-                },
-                region: AwsUtil.GetPartitionRegion(),
-            });
-            const response = await iam.listAccountAliases({ MaxItems: 1 }).promise();
-            if (response && response.AccountAliases && response.AccountAliases.length >= 1) {
-                return response.AccountAliases[0];
-            } else {
-                return undefined;
-            }
-        } catch (err) {
-            ConsoleUtil.LogDebug(`unable to get iam alias for account ${accountId}\nerr: ${err}`);
-            throw err;
-        }
-
-    }
-
     private static async getIamPasswordPolicyForAccount(that: AwsOrganizationReader, accountId: string): Promise<IAM.PasswordPolicy> {
         try {
             await that.organization.getValue();
             const targetRoleConfig = await GetOrganizationAccessRoleInTargetAccount(that.crossAccountConfig, accountId);
-            const iamService = await AwsUtil.GetIamService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole);
+            const iamService: IAM = await AwsUtil.GetIamService(accountId, targetRoleConfig.role, targetRoleConfig.viaRole, that.isPartition);
+
             try {
                 const response = await iamService.getAccountPasswordPolicy().promise();
                 return response.PasswordPolicy;
@@ -426,8 +371,9 @@ export class AwsOrganizationReader {
     public readonly organization: Lazy<Organization>;
     public readonly roots: Lazy<AWSRoot[]>;
     private readonly organizationService: Organizations;
+    private isPartition: boolean;
 
-    constructor(organizationService: Organizations, private readonly crossAccountConfig?: ICrossAccountConfig, partitionCredentials?: CredentialsOptions) {
+    constructor(organizationService: Organizations, private readonly crossAccountConfig?: ICrossAccountConfig) {
 
         this.organizationService = organizationService;
         this.policies = new Lazy(this, AwsOrganizationReader.listPolicies);
@@ -435,10 +381,7 @@ export class AwsOrganizationReader {
         this.accounts = new Lazy(this, AwsOrganizationReader.listAccounts);
         this.organization = new Lazy(this, AwsOrganizationReader.getOrganization);
         this.roots = new Lazy(this, AwsOrganizationReader.listRoots);
-        if (partitionCredentials) {
-            this.partitionOrgService = new Organizations({ credentials: partitionCredentials, region: AwsUtil.GetPartitionRegion() });
-            this.partitionOrgSTS = new STS({ credentials: partitionCredentials, region: AwsUtil.GetPartitionRegion() });
-        }
+        this.isPartition = false;
     }
 }
 

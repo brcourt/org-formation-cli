@@ -4,7 +4,7 @@ import { Organizations } from 'aws-sdk';
 import { Command } from 'commander';
 import RC from 'rc';
 import { CredentialsOptions } from 'aws-sdk/lib/credentials';
-import { AwsUtil } from '../util/aws-util';
+import { AwsUtil, DEFAULT_ROLE_FOR_ORG_ACCESS } from '../util/aws-util';
 import { ConsoleUtil } from '../util/console-util';
 import { OrgFormationError } from '../org-formation-error';
 import { IPerformTasksCommandArgs } from './perform-tasks';
@@ -84,14 +84,26 @@ export abstract class BaseCliCommand<T extends ICommandArgs> {
     public async generateDefaultTemplate(defaultBuildAccessRoleName?: string, templateGenerationSettings?: ITemplateGenerationSettings): Promise<DefaultTemplate> {
         const organizations = new Organizations({ region: 'us-east-1' });
         const partitionCredentials = await AwsUtil.GetPartitionCredentials();
-        let awsReader: AwsOrganizationReader;
-        if (partitionCredentials) {
-            awsReader = new AwsOrganizationReader(organizations, null, partitionCredentials);
-        } else {
-            awsReader = new AwsOrganizationReader(organizations);
-        }
+
+        // configure default Organization/Reader
+        const awsReader: AwsOrganizationReader = new AwsOrganizationReader(organizations);
         const awsOrganization = new AwsOrganization(awsReader);
-        const writer = new DefaultTemplateWriter(awsOrganization);
+        await awsOrganization.initialize();
+
+        // configure partition Organization/Reader
+        let partitionReader: AwsOrganizationReader;
+        let partitionOrganization: AwsOrganization;
+        if (partitionCredentials) {
+            const masterAccountId = await AwsUtil.GetPartitionMasterAccountId();
+            const accessRoleName = (defaultBuildAccessRoleName) ? defaultBuildAccessRoleName : DEFAULT_ROLE_FOR_ORG_ACCESS.RoleName;
+            const crossAccountConfig = { masterAccountId, masterAccountRoleName: accessRoleName, isPartition: true };
+            const partitionOrgService = new Organizations({ credentials: partitionCredentials, region: AwsUtil.GetPartitionRegion() });
+            partitionReader = new AwsOrganizationReader(partitionOrgService, crossAccountConfig);
+            partitionOrganization = new AwsOrganization(partitionReader);
+            await partitionOrganization.initialize();
+        }
+
+        const writer = new DefaultTemplateWriter(awsOrganization, partitionOrganization);
         writer.DefaultBuildProcessAccessRoleName = defaultBuildAccessRoleName;
         const template = await writer.generateDefaultTemplate(templateGenerationSettings);
         template.template = template.template.replace(/( *)-\n\1 {2}/g, '$1- ');
@@ -172,22 +184,26 @@ export abstract class BaseCliCommand<T extends ICommandArgs> {
         const organizations = await AwsUtil.GetOrganizationsService(masterAccountId, roleInMasterAccount);
         const partitionCredentials = await AwsUtil.GetPartitionCredentials();
         const crossAccountConfig = { masterAccountId, masterAccountRoleName: roleInMasterAccount };
-        let awsReader: AwsOrganizationReader;
-        if (partitionCredentials) {
-            awsReader = new AwsOrganizationReader(organizations, crossAccountConfig, partitionCredentials);
-        } else {
-            awsReader = new AwsOrganizationReader(organizations, crossAccountConfig);
-        }
+
+        // configure default Organization/Reader/Writer
+        const awsReader: AwsOrganizationReader = new AwsOrganizationReader(organizations, crossAccountConfig);
         const awsOrganization = new AwsOrganization(awsReader);
         await awsOrganization.initialize();
-        let awsWriter: AwsOrganizationWriter;
+        const awsWriter = new AwsOrganizationWriter(organizations, awsOrganization, crossAccountConfig);
 
+        // configure partition Organization/Reader/Writer
+        let partitionReader: AwsOrganizationReader;
+        let partitionOrganization: AwsOrganization;
+        let partitionWriter: AwsOrganizationWriter;
         if (partitionCredentials) {
-            awsWriter = new AwsOrganizationWriter(organizations, awsOrganization, crossAccountConfig, partitionCredentials);
-        } else {
-            awsWriter = new AwsOrganizationWriter(organizations, awsOrganization, crossAccountConfig);
+            const partitionOrgService = new Organizations({ credentials: partitionCredentials, region: AwsUtil.GetPartitionRegion() });
+            partitionReader = new AwsOrganizationReader(partitionOrgService, crossAccountConfig);
+            partitionOrganization = new AwsOrganization(partitionReader);
+            await partitionOrganization.initialize();
+            partitionWriter = new AwsOrganizationWriter(partitionOrgService, partitionOrganization, crossAccountConfig);
         }
-        const taskProvider = new TaskProvider(template, state, awsWriter);
+
+        const taskProvider = new TaskProvider(template, state, awsWriter, partitionWriter);
         const binder = new OrganizationBinder(template, state, taskProvider);
         return binder;
     }
@@ -279,17 +295,6 @@ export abstract class BaseCliCommand<T extends ICommandArgs> {
             ConsoleUtil.colorizeLogs = false;
         }
 
-        await AwsUtil.InitializeWithProfile(command.profile, command.isPartition);
-
-        if (command.masterAccountId !== undefined) {
-            AwsUtil.SetMasterAccountId(command.masterAccountId);
-        }
-
-        if (command.debugTemplating) {
-            NunjucksDebugSettings.debug = true;
-        }
-
-        await AwsUtil.InitializeWithCurrentPartition();
         if (command.partitionProfile !== undefined) {
             AwsUtil.SetPartitionProfile(command.partitionProfile);
             await AwsUtil.SetPartitionCredentials(command.partitionProfile);
@@ -306,6 +311,17 @@ export abstract class BaseCliCommand<T extends ICommandArgs> {
         if (command.partitionKeys) {
             await AwsUtil.SetPartitionCredentials();
         }
+
+        await AwsUtil.InitializeWithProfile(command.profile, command.isPartition);
+
+        if (command.masterAccountId !== undefined) {
+            AwsUtil.SetMasterAccountId(command.masterAccountId);
+        }
+
+        if (command.debugTemplating) {
+            NunjucksDebugSettings.debug = true;
+        }
+
         await AwsUtil.InitializeWithCurrentPartition();
 
         command.initialized = true;

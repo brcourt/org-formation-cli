@@ -28,7 +28,7 @@ export class AwsUtil {
 
     public static ClearCache(): void {
         AwsUtil.masterAccountId = undefined;
-        AwsUtil.masterPartitionAccountId = undefined;
+        AwsUtil.masterPartitionId = undefined;
         AwsUtil.partitionProfile = undefined;
         AwsUtil.partitionCredentials = undefined;
         AwsUtil.CfnServiceCache = {};
@@ -42,8 +42,8 @@ export class AwsUtil {
         if (this.organization !== undefined) {
             return this.organization.Organization.Id;
         }
-
-        const organizationService = new Organizations({ region: 'us-east-1' });
+        const region = (this.isPartition) ? this.partitionRegion : 'us-east-1';
+        const organizationService = new Organizations({ region });
         this.organization = await organizationService.describeOrganization().promise();
         return this.organization.Organization.Id;
 
@@ -69,13 +69,30 @@ export class AwsUtil {
                 (): AWS.Credentials => new AWS.ProcessCredentials(params),
             ]);
         }
-        const defaultProviders = CredentialProviderChain.defaultProviders;
-
-        defaultProviders.splice(5, 0, (): AWS.Credentials => new SingleSignOnCredentials());
         if (partition) {
+            process.env.AWS_SDK_LOAD_CONFIG = '1';
+            console.log(await AwsUtil.partitionProfile);
+            const params: CredentialProviderOptions = { profile: await AwsUtil.partitionProfile };
+            if (process.env.AWS_SHARED_CREDENTIALS_FILE) {
+                params.filename = process.env.AWS_SHARED_CREDENTIALS_FILE;
+            }
+
+            // Setup a MFA callback to ask the code from user
+            params.tokenCodeFn = async (mfaSerial: string, callback: any): Promise<void> => {
+                const token = await ConsoleUtil.Readline(`👋 Enter MFA code for ${mfaSerial}`);
+                callback(null, token);
+            };
             AWS.config.region = AwsUtil.GetPartitionRegion();
-            defaultProviders.splice(0, 0, (): AWS.Credentials => new EnvironmentCredentials('GOV_AWS'));
+            return await this.Initialize([
+                (): AWS.Credentials => new EnvironmentCredentials('GOV_AWS'),
+                (): AWS.Credentials => new AWS.SharedIniFileCredentials(params),
+                (): AWS.Credentials => new SingleSignOnCredentials(params),
+                (): AWS.Credentials => new AWS.ProcessCredentials(params),
+            ]);
         }
+
+        const defaultProviders = CredentialProviderChain.defaultProviders;
+        defaultProviders.splice(5, 0, (): AWS.Credentials => new SingleSignOnCredentials());
 
         return await this.Initialize(defaultProviders);
     }
@@ -179,14 +196,14 @@ export class AwsUtil {
         return partition;
     }
     public static async GetPartitionMasterAccountId(): Promise<string> {
-        if (AwsUtil.masterPartitionAccountId !== undefined) {
-            return AwsUtil.masterPartitionAccountId;
+        if (AwsUtil.masterPartitionId !== undefined) {
+            return AwsUtil.masterPartitionId;
         }
         const partitionCredentials = await AwsUtil.GetPartitionCredentials();
         const stsClient = new STS({ credentials: partitionCredentials, region: this.partitionRegion }); // if not set, assume build process runs in master
         const caller = await stsClient.getCallerIdentity().promise();
-        AwsUtil.masterPartitionAccountId = caller.Account;
-        return AwsUtil.masterPartitionAccountId;
+        AwsUtil.masterPartitionId = caller.Account;
+        return AwsUtil.masterPartitionId;
     }
 
     public static async GetBuildProcessAccountId(): Promise<string> {
@@ -204,12 +221,12 @@ export class AwsUtil {
     }
 
 
-    public static async GetOrganizationsService(accountId: string, roleInTargetAccount: string): Promise<Organizations> {
-        return await AwsUtil.GetOrCreateService<Organizations>(Organizations, AwsUtil.OrganizationsServiceCache, accountId, `${accountId}/${roleInTargetAccount}`, { region: 'us-east-1' }, roleInTargetAccount);
+    public static async GetOrganizationsService(accountId: string, roleInTargetAccount: string, viaRoleArn?: string, isPartition?: boolean): Promise<Organizations> {
+        return await AwsUtil.GetOrCreateService<Organizations>(Organizations, AwsUtil.OrganizationsServiceCache, accountId, `${accountId}/${roleInTargetAccount}/${viaRoleArn}`, { region: 'us-east-1' }, roleInTargetAccount, viaRoleArn, isPartition);
     }
 
-    public static async GetSupportService(accountId: string, roleInTargetAccount: string, viaRoleArn?: string): Promise<Support> {
-        return await AwsUtil.GetOrCreateService<Support>(Support, AwsUtil.SupportServiceCache, accountId, `${accountId}/${roleInTargetAccount}/${viaRoleArn}`, { region: 'us-east-1' }, roleInTargetAccount, viaRoleArn);
+    public static async GetSupportService(accountId: string, roleInTargetAccount: string, viaRoleArn?: string, isPartition?: boolean): Promise<Support> {
+        return await AwsUtil.GetOrCreateService<Support>(Support, AwsUtil.SupportServiceCache, accountId, `${accountId}/${roleInTargetAccount}/${viaRoleArn}`, { region: 'us-east-1' }, roleInTargetAccount, viaRoleArn, isPartition);
     }
 
     public static GetRoleArn(accountId: string, roleInTargetAccount: string): string {
@@ -232,8 +249,8 @@ export class AwsUtil {
         return 'arn:aws-us-gov:iam::' + accountId + ':role/' + roleInTargetAccount;
     }
 
-    public static async GetIamService(accountId: string, roleInTargetAccount?: string, viaRoleArn?: string): Promise<IAM> {
-        return await AwsUtil.GetOrCreateService<IAM>(IAM, AwsUtil.IamServiceCache, accountId, `${accountId}/${roleInTargetAccount}/${viaRoleArn}`, {}, roleInTargetAccount, viaRoleArn);
+    public static async GetIamService(accountId: string, roleInTargetAccount?: string, viaRoleArn?: string, isPartition?: boolean): Promise<IAM> {
+        return await AwsUtil.GetOrCreateService<IAM>(IAM, AwsUtil.IamServiceCache, accountId, `${accountId}/${roleInTargetAccount}/${viaRoleArn}`, {}, roleInTargetAccount, viaRoleArn, isPartition);
     }
 
     public static async GetCloudFormation(accountId: string, region: string, roleInTargetAccount?: string, viaRoleArn?: string): Promise<CloudFormation> {
@@ -245,7 +262,7 @@ export class AwsUtil {
         await s3client.deleteObject({ Bucket: bucketName, Key: objectKey }).promise();
     }
 
-    private static async GetOrCreateService<TService>(ctr: new (args: CloudFormation.Types.ClientConfiguration) => TService, cache: Record<string, TService>, accountId: string, cacheKey: string = accountId, clientConfig: ServiceConfigurationOptions = {}, roleInTargetAccount: string, viaRoleArn?: string): Promise<TService> {
+    private static async GetOrCreateService<TService>(ctr: new (args: CloudFormation.Types.ClientConfiguration) => TService, cache: Record<string, TService>, accountId: string, cacheKey: string = accountId, clientConfig: ServiceConfigurationOptions = {}, roleInTargetAccount: string, viaRoleArn?: string, isPartition?: boolean): Promise<TService> {
         const cachedService = cache[cacheKey];
         if (cachedService) {
             return cachedService;
@@ -258,9 +275,12 @@ export class AwsUtil {
             roleInTargetAccount = GlobalState.GetCrossAccountRoleName(accountId);
         }
 
-        const credentialOptions: CredentialsOptions = await AwsUtil.GetCredentials(accountId, roleInTargetAccount, viaRoleArn);
+        const credentialOptions: CredentialsOptions = await AwsUtil.GetCredentials(accountId, roleInTargetAccount, viaRoleArn, isPartition);
         if (credentialOptions !== undefined) {
             config.credentials = credentialOptions;
+            if (isPartition) {
+                config.region = this.partitionRegion;
+            }
         }
 
         const service = new ctr(config);
@@ -269,9 +289,9 @@ export class AwsUtil {
         return service;
     }
 
-    public static async GetCredentials(accountId: string, roleInTargetAccount: string, viaRoleArn?: string): Promise<CredentialsOptions | undefined> {
+    public static async GetCredentials(accountId: string, roleInTargetAccount: string, viaRoleArn?: string, isPartition?: boolean): Promise<CredentialsOptions | undefined> {
 
-        const masterAccountId = await AwsUtil.GetMasterAccountId();
+        const masterAccountId = (isPartition) ? await AwsUtil.GetPartitionMasterAccountId() : await AwsUtil.GetMasterAccountId();
         const useCurrentPrincipal = (masterAccountId === accountId && roleInTargetAccount === GlobalState.GetOrganizationAccessRoleName(accountId));
         if (useCurrentPrincipal) {
             return undefined;
@@ -280,18 +300,20 @@ export class AwsUtil {
         try {
             let roleArn: string;
             const config: STS.ClientConfiguration = {};
+            if (viaRoleArn !== undefined) {
+                config.credentials = await AwsUtil.GetCredentialsForRole(viaRoleArn, {});
+            }
 
-            if (AwsUtil.isPartition) {
+            if (AwsUtil.isPartition || isPartition) {
                 roleArn = AwsUtil.GetPartitionRoleArn(accountId, roleInTargetAccount);
+                config.credentials = await AwsUtil.GetPartitionCredentials();
                 config.region = this.partitionRegion;
             } else {
                 roleArn = AwsUtil.GetRoleArn(accountId, roleInTargetAccount);
             }
 
-            if (viaRoleArn !== undefined) {
-                config.credentials = await AwsUtil.GetCredentialsForRole(viaRoleArn, {});
-            }
             return await AwsUtil.GetCredentialsForRole(roleArn, config);
+
         } catch (err) {
             const buildAccountId = await AwsUtil.GetBuildProcessAccountId();
             if (accountId === buildAccountId) {
@@ -311,7 +333,6 @@ export class AwsUtil {
 
     private static async GetCredentialsForRole(roleArn: string, config: STS.ClientConfiguration): Promise<CredentialsOptions> {
         const sts = new STS(config);
-
         const response = await sts.assumeRole({ RoleArn: roleArn, RoleSessionName: 'OrganizationFormationBuild' }).promise();
         const credentialOptions: CredentialsOptions = {
             accessKeyId: response.Credentials.AccessKeyId,
@@ -323,15 +344,33 @@ export class AwsUtil {
     }
 
     public static async GetCloudFormationExport(exportName: string, accountId: string, region: string, customRoleName: string, customViaRoleArn?: string): Promise<string | undefined> {
+        const cacheKey = `${exportName}|${accountId}|${region}|${customRoleName}${customViaRoleArn}`;
+        const cachedVal = this.CfnExportsCache[cacheKey];
+        if (cachedVal !== undefined) { return cachedVal; }
+
         const cfnRetrieveExport = await AwsUtil.GetCloudFormation(accountId, region, customRoleName, customViaRoleArn);
         const listExportsRequest: ListExportsInput = {};
         do {
-            const listExportsResponse = await cfnRetrieveExport.listExports(listExportsRequest).promise();
-            listExportsRequest.NextToken = listExportsResponse.NextToken;
-            const foundExport = listExportsResponse.Exports.find(x => x.Name === exportName);
-            if (foundExport) {
-                return foundExport.Value;
-            }
+            let throttled = false;
+            let throttledCount = 0;
+            do {
+                throttled = false;
+                try {
+                    const listExportsResponse = await cfnRetrieveExport.listExports(listExportsRequest).promise();
+                    listExportsRequest.NextToken = listExportsResponse.NextToken;
+                    const foundExport = listExportsResponse.Exports.find(x => x.Name === exportName);
+                    if (foundExport) {
+                        this.CfnExportsCache[cacheKey] = foundExport.Value;
+                        return foundExport.Value;
+                    }
+                } catch (err) {
+                    if (err.code === 'Throttling') {
+                        throttledCount += 1;
+                        await sleep(throttledCount * (1.5 * Math.random()));
+                        throttled = true;
+                    } else { throw err; }
+                }
+            } while (throttled);
         } while (listExportsRequest.NextToken);
         return undefined;
     }
@@ -360,7 +399,7 @@ export class AwsUtil {
     public static partition: string | undefined;
     private static partitionRegion = 'us-gov-west-1';
     private static masterAccountId: string | PromiseLike<string>;
-    private static masterPartitionAccountId: string | PromiseLike<string>;
+    private static masterPartitionId: string | PromiseLike<string>;
     private static partitionProfile: string | PromiseLike<string>;
     private static partitionCredentials: CredentialsOptions;
     private static buildProcessAccountId: string | PromiseLike<string>;
@@ -369,6 +408,7 @@ export class AwsUtil {
     private static OrganizationsServiceCache: Record<string, Organizations> = {};
     private static CfnServiceCache: Record<string, CloudFormation> = {};
     private static S3ServiceCache: Record<string, S3> = {};
+    private static CfnExportsCache: Record<string, string> = {};
     private static isPartition = false;
 }
 
